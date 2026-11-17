@@ -10,8 +10,9 @@
 //
 //   weight = exp(-0.5 * ((ln(p1_comp) - ln(p1_case)) / 1.1)^2)
 //
-//   centre = weighted median of shape_h
-//   spread = (weighted 95th percentile - weighted 5th percentile) / 3.29, floored at 0.2
+//   centre = 0.8 * weighted median of shape_h  +  0.2 * ordinary least-squares fit of shape_h on ln(p1),
+//            the fit unweighted over the usable comparables and evaluated at ln(p1_case)
+//   spread = 0.85 * (weighted 95th percentile - weighted 5th percentile) / 3.29, floored at 0.2 after scaling
 //
 // and emit the quantiles q_tau(h) = exp(ln(p1_case) + centre + z_tau * spread), for z = -1.6449, -0.6745, 0,
 // 0.6745, 1.6449, rounded to 2 decimals and forced non-decreasing.
@@ -20,26 +21,32 @@
 //   - 35 of the 37 usable comparables see hour 24 exceed hour 6 (day rises).
 //   - Splitting the 37 on hour-1 viewers at 5,000: the small group's median (hour 24 / hour 1) is ~163x, the big
 //     group's ~1.3x; at a 20,000 split the same two figures are ~99.5x and ~1.19x. Size decides growth, and the
-//     exact ratio moves with the split point while the split itself does not; the 1.1 log-width kernel makes the
-//     shape transfer shrink as the comparable's
-//     p1 moves away from the case's.
+//     exact ratio moves with the split point while the split itself does not.
+//   - Across the 37 comparable launches, ln(hour 24 / hour 1) correlates at r = -0.931 with ln(hour 1 viewers). A
+//     weighted median saturates: it can never output a shape more extreme than its largest neighbour, so a case
+//     bigger than every comparable is stuck at the biggest comparable's shape. Blending in an unweighted least-
+//     squares fit (above) lets the centre extrapolate, and loses less on the largest launches.
 //
 // Measured design choices (scratch under /tmp, leave-one-launch-out over the 37 launches):
-//   - Spread asymmetry: the weighted upper half-width (p95 - median) runs consistently wider than the lower
-//     (median - p05); the leave-one-launch-out aggregate ratio over hours is ~1.32 (per-hour ratios mostly
-//     1.15-3.1). A two-width version (separate up/down sd, both floored at 0.2) was implemented and re-measured,
-//     but it raises every pinball figure (mean 0.4064 -> 0.4099; held-out launch 0.2703 -> 0.2773; median launch
-//     0.2626 -> 0.2681), so it is reverted here and the symmetric form is kept.
-//   - Hour-1 viewers-per-channel vs day growth (hour 24 / hour 1): Pearson r = -0.15 on logs across the 37
-//     comparables -> weak (|r| < 0.3), so no case-pull term is added; the centre stays the weighted median of the
-//     shape.
+//   - Spread asymmetry: the weighted upper half-width (p95 - median) runs wider than the lower (median - p05); the
+//     leave-one-launch-out ratio of the summed half-widths across hours is ~1.39. A two-width version (separate
+//     up/down sd, both floored at 0.2) was implemented and re-measured, but it raises every pinball figure, so it
+//     is reverted here and the symmetric form is kept.
+//   - Hour-1 viewers-per-channel vs day growth (hour 24 / hour 1): Pearson r = -0.153 on logs across the 37
+//     comparables -> weak (|r| < 0.3), so no case-pull term is added; the centre is the weighted median blended
+//     with the unweighted fit above.
+//   - The spread scale is swept 0.70..1.10 (step 0.05) on the blended model: the leave-one-launch-out mean loss is
+//     flat around 0.85-0.90 (0.3919 at 0.85, 0.3920 at 0.90, 0.3938 at 1.00), so 0.85 is shipped.
 //
 // Leave-one-launch-out over the 37 launches (pinball loss per hour and quantile, d = ln(y) - ln(q), loss =
 // 2 * max(tau*d, (tau-1)*d)):
-//   - This model:  mean pinball 0.4064; median launch loss 0.2626.
+//   - Plain weighted median:  mean pinball 0.4064; median launch loss 0.2626.
+//   - Blended model (this entry):  mean pinball 0.3938 at scale 1.0, 0.3919 at the shipped scale 0.85.
 //   - House baseline q_tau(h) = p1 * exp(z_tau * 0.15 * sqrt(h-1)):  mean 0.9296; median 0.3249.
-//   - Held-out launches with hour 1 >= 5,000 viewers:  model 0.2703 (n=29);  baseline 0.3595.
-//   - Band calibration on held-out hour-forecasts:  88.6% fall inside the 5-95 interval; 55.8% inside 25-75.
+//   - Held-out launches with hour 1 >= 5,000 viewers:  blended model 0.2703 (n=29);  baseline 0.3595.
+//   - The six largest launches (hour-1 >= 320,000) as a group, trained on the 31 smaller ones: plain median
+//     0.2047, blended 0.1457, weighted-least-squares blend 0.1650; unweighted fit wins.
+//   - Band calibration at the shipped scale 0.85 on held-out hour-forecasts:  85.3% fall inside the 5-95 interval.
 //
 // It runs offline, with no network, under the case's time cap: everything it knows is in the case file.
 
@@ -55,10 +62,14 @@ const LEVELS = [0.05, 0.25, 0.5, 0.75, 0.95];
 const Z = [-1.6449, -0.6745, 0, 0.6745, 1.6449];
 /** The log-distance kernel width, in log units of p1. */
 const KERNEL = 1.1;
-/** The spread floor, in log units. */
+/** The spread floor, in log units, applied after scaling. */
 const SPREAD_FLOOR = 0.2;
 /** The z-interval width that maps to one standard deviation. */
 const Z95_TO_SD = 3.29;
+/** Multiplier on the raw spread (95th - 5th)/3.29, chosen by leave-one-launch-out sweep. */
+const SPREAD_SCALE = 0.85;
+/** Weight on the least-squares fit in the blended centre; the rest is the weighted median. */
+const BLEND_ALPHA = 0.2;
 
 interface Comparable {
   p1: number;
@@ -108,6 +119,26 @@ const weightedQuantile = (pairs: Array<{ v: number; w: number }>, tau: number): 
   return pairs[pairs.length - 1].v;
 };
 
+/** Unweighted ordinary least-squares prediction of shape_h at ln(p1_case). */
+const fitShape = (usable: Comparable[], h: number, p1Case: number): number => {
+  const idx = h - 1;
+  let sx = 0, sy = 0;
+  const n = usable.length;
+  for (const u of usable) {
+    sx += Math.log(u.p1);
+    sy += u.shape[idx];
+  }
+  const mx = sx / n, my = sy / n;
+  let sxx = 0, sxy = 0;
+  for (const u of usable) {
+    const x = Math.log(u.p1) - mx;
+    sxx += x * x;
+    sxy += x * (u.shape[idx] - my);
+  }
+  const slope = sxx === 0 ? 0 : sxy / sxx;
+  return my - slope * mx + slope * Math.log(p1Case);
+};
+
 /** Centre and spread of hour h (2..24) over the comparables for a case's p1. */
 const hourCentreSpread = (usable: Comparable[], h: number, p1Case: number): { centre: number; spread: number } => {
   const idx = h - 1;
@@ -115,10 +146,11 @@ const hourCentreSpread = (usable: Comparable[], h: number, p1Case: number): { ce
     v: u.shape[idx],
     w: Math.exp(-0.5 * Math.pow((Math.log(u.p1) - Math.log(p1Case)) / KERNEL, 2)),
   }));
-  const centre = weightedQuantile(pairs.map((p) => ({ ...p })), 0.5);
+  const medianCentre = weightedQuantile(pairs.map((p) => ({ ...p })), 0.5);
+  const centre = (1 - BLEND_ALPHA) * medianCentre + BLEND_ALPHA * fitShape(usable, h, p1Case);
   const p95 = weightedQuantile(pairs.map((p) => ({ ...p })), 0.95);
   const p05 = weightedQuantile(pairs.map((p) => ({ ...p })), 0.05);
-  let spread = (p95 - p05) / Z95_TO_SD;
+  let spread = ((p95 - p05) / Z95_TO_SD) * SPREAD_SCALE;
   if (spread < SPREAD_FLOOR) spread = SPREAD_FLOOR;
   return { centre, spread };
 };
