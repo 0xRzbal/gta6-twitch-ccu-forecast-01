@@ -24,6 +24,16 @@
 //     shape transfer shrink as the comparable's
 //     p1 moves away from the case's.
 //
+// Measured design choices (scratch under /tmp, leave-one-launch-out over the 37 launches):
+//   - Spread asymmetry: the weighted upper half-width (p95 - median) runs consistently wider than the lower
+//     (median - p05); the leave-one-launch-out aggregate ratio over hours is ~1.32 (per-hour ratios mostly
+//     1.15-3.1). A two-width version (separate up/down sd, both floored at 0.2) was implemented and re-measured,
+//     but it raises every pinball figure (mean 0.4064 -> 0.4099; held-out launch 0.2703 -> 0.2773; median launch
+//     0.2626 -> 0.2681), so it is reverted here and the symmetric form is kept.
+//   - Hour-1 viewers-per-channel vs day growth (hour 24 / hour 1): Pearson r = -0.15 on logs across the 37
+//     comparables -> weak (|r| < 0.3), so no case-pull term is added; the centre stays the weighted median of the
+//     shape.
+//
 // Leave-one-launch-out over the 37 launches (pinball loss per hour and quantile, d = ln(y) - ln(q), loss =
 // 2 * max(tau*d, (tau-1)*d)):
 //   - This model:  mean pinball 0.4064; median launch loss 0.2626.
